@@ -341,6 +341,10 @@ if [[ -n "$(listeners 443)" ]]; then
     echo -e "${RED}✗ TCP :443 занят, но Nginx не активен — автоматическая миграция невозможна.${NC}"; listeners 443; exit 1
   fi
   discover_existing_stream
+  if [[ -n "$ACTIVE_STREAM_CONF" && "$ACTIVE_STREAM_PROXY_PROTOCOL" == on && -z "${SNI_PROXY_PROTOCOL:-}" ]]; then
+    PROXY_PROTOCOL=on
+    echo -e "${YELLOW}⚠ Existing router uses PROXY protocol; preserving it automatically.${NC}"
+  fi
   if [[ -z "$ACTIVE_STREAM_CONF" || -z "$ACTIVE_STREAM_MAP_VAR" ]]; then
     echo -e "${RED}✗ :443 занят Nginx, но активный stream/ssl_preread-router не найден.${NC}"
     echo "Скрипт не будет ломать существующий HTTPS :443 автоматически."; listeners 443; exit 1
