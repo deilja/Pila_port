@@ -1,484 +1,354 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 022
 
-# ============================================================
-#  3X-UI SNI Router + Separate Subscription Domain (v2)
-#  Nginx Stream (SNI) + HTTPS для панели и подписки
-# ============================================================
+# Pila_port — 3X-UI SNI Router
+# TCP :443 -> SNI preread -> panel/sub/reality backends.
 
-set -euo pipefail
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; CYAN='\033[0;36m'; NC='\033[0m'
+LOG_FILE=/var/log/setup-3xui-sni.log
+NGINX_CONF=/etc/nginx/nginx.conf
+STREAM_DIR=/etc/nginx/stream.d
+STREAM_CONF=$STREAM_DIR/sni-router.conf
+PANEL_CONF=/etc/nginx/conf.d/pila-panel.conf
+SUB_CONF=/etc/nginx/conf.d/pila-sub.conf
+ACME_ROOT=/var/www/pila-port-acme
+ACME_CONF=/etc/nginx/conf.d/zz-pila-port-acme.conf
+BACKUPS=()
+CREATED=()
 
-# Цвета
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-NC='\033[0m'
+log(){ echo "[$(date '+%F %T')] $*" >>"$LOG_FILE" 2>/dev/null || true; }
+rollback(){
+  local x f b
+  for x in "${BACKUPS[@]}"; do f=${x%%|*}; b=${x#*|}; [[ -f "$b" ]] && cp -a "$b" "$f" || true; done
+  for f in "${CREATED[@]}"; do rm -f "$f" || true; done
+}
+on_error(){ local rc=$?; echo -e "${RED}✗ Ошибка (код $rc), изменения откатываются.${NC}"; log "ERROR rc=$rc line=${BASH_LINENO[0]}"; rollback; if command -v nginx >/dev/null 2>&1 && systemctl is-active --quiet nginx 2>/dev/null && nginx -t >/dev/null 2>&1; then systemctl reload nginx >/dev/null 2>&1 || true; fi; exit "$rc"; }
+trap on_error ERR
 
-LOG_FILE="/var/log/setup-3xui-sni.log"
+need(){ command -v "$1" >/dev/null 2>&1 || { echo -e "${RED}✗ Не найдена команда: $1${NC}"; exit 1; }; }
 
-echo -e "${BLUE}"
-echo "======================================================"
-echo "  3X-UI SNI Router + Separate Subscription  (v2)"
-echo "  (Nginx Stream + HTTPS)"
-echo "======================================================"
-echo -e "${NC}"
-
-# ====================== Функции ======================
-
-log() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE" >/dev/null
+ask_domain(){
+  local p=$1 v
+  while true; do
+    read -rp "$(echo -e "${CYAN}${p}: ${NC}")" v
+    v=$(tr -d '[:space:]' <<<"$v" | tr '[:upper:]' '[:lower:]')
+    [[ "$v" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]] && { printf '%s\n' "$v"; return; }
+    echo -e "${RED}Некорректный домен.${NC}"
+  done
+}
+ask_port(){
+  local p=$1 d=$2 v
+  while true; do
+    read -rp "$(echo -e "${CYAN}${p} [${d}]: ${NC}")" v; v=${v:-$d}
+    [[ "$v" =~ ^[0-9]+$ ]] && ((v>=1&&v<=65535)) && { printf '%s\n' "$v"; return; }
+    echo -e "${RED}Порт: 1-65535.${NC}"
+  done
+}
+ask_path(){
+  local p=$1 d=$2 v
+  while true; do
+    read -rp "$(echo -e "${CYAN}${p} [${d}]: ${NC}")" v; v=${v:-$d}; [[ "$v" == /* ]] || v="/$v"; [[ "$v" == */ ]] || v="$v/"
+    [[ "$v" =~ ^/[A-Za-z0-9_-]+(/[A-Za-z0-9_-]+)*/$ ]] && { printf '%s\n' "$v"; return; }
+    echo -e "${RED}Путь должен быть вида /panel/.${NC}"
+  done
+}
+ask_email(){
+  local v; read -rp "$(echo -e "${CYAN}Email Let's Encrypt (необязательно): ${NC}")" v
+  [[ -z "$v" ]] || [[ "$v" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]] || { echo -e "${YELLOW}⚠ Некорректный email — продолжу без него.${NC}" >&2; v=''; }
+  printf '%s\n' "$v"
 }
 
-check_root() {
-    if [[ $EUID -ne 0 ]]; then
-        echo -e "${RED}Ошибка: запускай скрипт от root (sudo ./setup-3xui-sni.sh)${NC}"
-        exit 1
-    fi
+backup(){
+  local f=$1 b
+  if [[ -f "$f" ]]; then b="${f}.bak.$(date +%Y%m%d_%H%M%S_$$)"; cp -a "$f" "$b"; BACKUPS+=("$f|$b"); echo -e "${GREEN}✓ Бэкап: $b${NC}"; else CREATED+=("$f"); fi
 }
 
-check_os() {
-    if [[ -f /etc/os-release ]]; then
-        . /etc/os-release
-        case "$ID" in
-            debian|ubuntu)
-                echo -e "${GREEN}✓ ОС: $PRETTY_NAME${NC}"
-                ;;
-            *)
-                echo -e "${YELLOW}⚠ ОС $PRETTY_NAME не тестировалась (ожидается Debian/Ubuntu)${NC}"
-                read -rp "Продолжить? (y/n): " ans
-                [[ "$ans" != "y" && "$ans" != "Y" ]] && exit 0
-                ;;
-        esac
-    fi
+listeners(){ ss -ltnpH 2>/dev/null | awk -v p=":$1" '$4 ~ p"$"'; }
+port_free(){ [[ -z "$(listeners "$1")" ]]; }
+
+check_backend(){
+  local port=$1 label=$2 out
+  out=$(listeners "$port")
+  if [[ -z "$out" ]]; then echo -e "${YELLOW}⚠ $label :$port не слушает — настрой его после установки.${NC}"; return 0; fi
+  if ! awk -v p=":$port" '$4 ~ /^(127\.0\.0\.1|\[::1\]):/ && $4 ~ p"$" {ok=1} END{exit(ok?0:1)}' <<<"$out"; then
+    echo -e "${RED}✗ $label :$port доступен не только через loopback:${NC}"; echo "$out"; return 1
+  fi
+  echo -e "${GREEN}✓ $label :$port → loopback${NC}"
 }
 
-check_port_free() {
-    local port=$1
-    local name=$2
-    if ss -tuln | grep -qE ":${port}\s"; then
-        echo -e "${RED}✗ Порт ${port} (${name}) занят${NC}"
-        return 1
-    else
-        echo -e "${GREEN}✓ Порт ${port} (${name}) свободен${NC}"
-        return 0
-    fi
+check_dns(){
+  local d=$1 ip=$2 r; r=$(dig +short A "$d" 2>/dev/null | awk 'NF{print;exit}')
+  [[ -n "$r" && "$r" == "$ip" ]] && { echo -e "${GREEN}✓ DNS A: $d → $r${NC}"; return 0; }
+  echo -e "${YELLOW}⚠ DNS A: $d → ${r:-не найден} (ожидался ${ip:-unknown})${NC}"; return 1
 }
 
-check_port_used() {
-    local port=$1
-    local name=$2
-    if ss -tuln | grep -qE ":${port}\s"; then
-        echo -e "${GREEN}✓ ${name} найден на порту ${port}${NC}"
-        return 0
-    else
-        echo -e "${YELLOW}⚠ ${name} не найден на порту ${port}${NC}"
-        return 1
-    fi
-}
+ensure_stream(){
+  mkdir -p "$STREAM_DIR"
+  if grep -Fq 'include /etc/nginx/stream.d/*.conf;' "$NGINX_CONF"; then return; fi
+  if grep -Eq '^[[:space:]]*stream[[:space:]]*\{' "$NGINX_CONF"; then
+    echo -e "${RED}✗ В nginx.conf уже есть stream-блок без Pila_port include.${NC}"
+    echo "Добавь внутрь него: include /etc/nginx/stream.d/*.conf;"; exit 1
+  fi
+  backup "$NGINX_CONF"
+  cat >>"$NGINX_CONF" <<'EOF_STREAM_ROOT'
 
-ask_domain() {
-    local prompt=$1
-    local domain
-    while true; do
-        read -rp "$(echo -e "${CYAN}${prompt}: ${NC}")" domain
-        domain=$(echo "$domain" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
-        if [[ -z "$domain" ]]; then
-            echo -e "${RED}Домен не может быть пустым${NC}"
-            continue
-        fi
-        if [[ ! "$domain" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]]; then
-            echo -e "${RED}Некорректный домен. Пример: panel.example.com${NC}"
-            continue
-        fi
-        echo "$domain"
-        return
-    done
-}
-
-ask_port() {
-    local prompt=$1
-    local default=$2
-    local port
-    while true; do
-        read -rp "$(echo -e "${CYAN}${prompt} [${default}]: ${NC}")" port
-        port=${port:-$default}
-        if [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )); then
-            echo "$port"
-            return
-        fi
-        echo -e "${RED}Введи корректный порт (1-65535)${NC}"
-    done
-}
-
-ask_path() {
-    local prompt=$1
-    local default=$2
-    local path
-    while true; do
-        read -rp "$(echo -e "${CYAN}${prompt} [${default}]: ${NC}")" path
-        path=${path:-$default}
-        [[ "$path" != /* ]] && path="/$path"
-        [[ "$path" != */ ]] && path="${path}/"
-        if [[ "$path" =~ ^/[a-zA-Z0-9/_-]+/$ ]]; then
-            echo "$path"
-            return
-        fi
-        echo -e "${RED}Путь должен быть вида /panel/ (только буквы, цифры, -, _)${NC}"
-    done
-}
-
-get_server_ip() {
-    local ip
-    ip=$(curl -s --max-time 3 https://ifconfig.me 2>/dev/null || true)
-    [[ -z "$ip" ]] && ip=$(curl -s --max-time 3 https://api.ipify.org 2>/dev/null || true)
-    [[ -z "$ip" ]] && ip=$(hostname -I 2>/dev/null | awk '{print $1}')
-    echo "$ip"
-}
-
-check_dns() {
-    local domain=$1
-    local expected_ip=$2
-    local resolved
-    resolved=$(dig +short "$domain" A 2>/dev/null | head -1 || true)
-    if [[ -z "$resolved" ]]; then
-        echo -e "${YELLOW}⚠ DNS: $domain не резолвится${NC}"
-        return 1
-    fi
-    if [[ "$resolved" == "$expected_ip" ]]; then
-        echo -e "${GREEN}✓ DNS: $domain → $resolved${NC}"
-        return 0
-    else
-        echo -e "${YELLOW}⚠ DNS: $domain → $resolved (ожидался $expected_ip)${NC}"
-        return 1
-    fi
-}
-
-backup_file() {
-    local file=$1
-    if [[ -f "$file" ]]; then
-        local bak="${file}.bak.$(date +%Y%m%d_%H%M%S)"
-        cp -a "$file" "$bak"
-        echo -e "${GREEN}✓ Бэкап: $bak${NC}"
-        log "Backup: $file → $bak"
-    fi
-}
-
-# ====================== Старт ======================
-
-check_root
-check_os
-
-touch "$LOG_FILE" 2>/dev/null || LOG_FILE="/tmp/setup-3xui-sni.log"
-log "=== Запуск скрипта ==="
-
-echo -e "${YELLOW}Введи домены (без https:// и без слэшей):${NC}"
-PANEL_DOMAIN=$(ask_domain "Домен панели (например panel.example.com)")
-SUB_DOMAIN=$(ask_domain "Домен подписки (например sub.example.com)")
-VPN_DOMAIN=$(ask_domain "Домен REALITY / VPN (например vpn.example.com)")
-
-echo
-echo -e "${YELLOW}Порты и путь 3x-ui:${NC}"
-PANEL_PORT=$(ask_port "Порт панели 3x-ui" "29395")
-SUB_PORT=$(ask_port "Порт Subscription" "2096")
-REALITY_PORT=$(ask_port "Локальный порт REALITY (Xray)" "443")
-PANEL_PATH=$(ask_path "Web Base Path панели" "/panel/")
-
-echo
-echo -e "${BLUE}Проверяю порты...${NC}"
-
-PORTS_OK=true
-
-check_port_free 443  "внешний HTTPS/SNI" || PORTS_OK=false
-check_port_free 80   "HTTP (для certbot)" || PORTS_OK=false
-check_port_free 8443 "Nginx HTTPS панели" || PORTS_OK=false
-check_port_free 8444 "Nginx HTTPS подписки" || PORTS_OK=false
-
-echo
-echo -e "${BLUE}Проверка портов 3x-ui:${NC}"
-PANEL_OK=true
-SUB_OK=true
-check_port_used "$PANEL_PORT" "Панель 3x-ui" || PANEL_OK=false
-check_port_used "$SUB_PORT" "Subscription" || SUB_OK=false
-
-if [[ "$PORTS_OK" == false ]]; then
-    echo
-    echo -e "${RED}Есть занятые порты, которые нужны скрипту.${NC}"
-    echo -e "${YELLOW}Останови конфликтующие сервисы (nginx, caddy, apache и т.д.) и запусти снова.${NC}"
-    exit 1
-fi
-
-if [[ "$PANEL_OK" == false || "$SUB_OK" == false ]]; then
-    echo
-    echo -e "${YELLOW}Внимание: панель или subscription не найдены на указанных портах.${NC}"
-    echo -e "Убедись, что 3x-ui слушает:"
-    echo "  - Панель: 127.0.0.1:${PANEL_PORT}"
-    echo "  - Subscription: 127.0.0.1:${SUB_PORT}"
-    echo
-    read -rp "Продолжить всё равно? (y/n): " cont
-    [[ "$cont" != "y" && "$cont" != "Y" ]] && exit 0
-fi
-
-echo
-echo -e "${BLUE}Проверяю DNS...${NC}"
-SERVER_IP=$(get_server_ip)
-echo -e "IP сервера: ${CYAN}${SERVER_IP}${NC}"
-
-DNS_OK=true
-check_dns "$PANEL_DOMAIN" "$SERVER_IP" || DNS_OK=false
-check_dns "$SUB_DOMAIN" "$SERVER_IP" || DNS_OK=false
-
-if [[ "$DNS_OK" == false ]]; then
-    echo
-    echo -e "${YELLOW}DNS ещё не указывает на этот сервер (или dig недоступен).${NC}"
-    echo -e "Certbot может не пройти. Продолжить? (рекомендуется дождаться обновления DNS)"
-    read -rp "(y/n): " cont
-    [[ "$cont" != "y" && "$cont" != "Y" ]] && exit 0
-fi
-
-echo
-echo -e "${GREEN}Домены:${NC}"
-echo "  Панель:      $PANEL_DOMAIN"
-echo "  Подписка:    $SUB_DOMAIN"
-echo "  REALITY:     $VPN_DOMAIN"
-echo
-echo -e "${GREEN}Порты и путь:${NC}"
-echo "  Панель:      $PANEL_PORT  (path: $PANEL_PATH)"
-echo "  Subscription:$SUB_PORT"
-echo "  REALITY:     $REALITY_PORT"
-echo
-read -rp "Всё верно? Продолжить установку? (y/n): " confirm
-[[ "$confirm" != "y" && "$confirm" != "Y" ]] && exit 0
-
-# ====================== Установка пакетов ======================
-
-echo
-echo -e "${BLUE}Устанавливаю Nginx + certbot + зависимости...${NC}"
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -y
-apt-get install -y nginx certbot python3-certbot-nginx curl dnsutils
-
-if command -v ufw >/dev/null 2>&1; then
-    echo -e "${BLUE}Открываю порты в ufw...${NC}"
-    ufw allow 80/tcp  >/dev/null 2>&1 || true
-    ufw allow 443/tcp >/dev/null 2>&1 || true
-    echo -e "${GREEN}✓ ufw: 80 и 443 разрешены${NC}"
-fi
-
-mkdir -p /etc/nginx/stream.d
-mkdir -p /etc/nginx/conf.d
-
-if ! grep -q "include /etc/nginx/stream.d" /etc/nginx/nginx.conf; then
-    if ! grep -q "^stream {" /etc/nginx/nginx.conf; then
-        backup_file /etc/nginx/nginx.conf
-        cat >> /etc/nginx/nginx.conf <<'EOF'
-
-# Stream (SNI router) — добавлено setup-3xui-sni
+# Pila_port SNI router
 stream {
     include /etc/nginx/stream.d/*.conf;
 }
-EOF
-        echo -e "${GREEN}✓ Добавлен stream-блок в nginx.conf${NC}"
-    else
-        echo -e "${YELLOW}⚠ stream-блок уже есть, но include stream.d не найден — проверь вручную${NC}"
-    fi
-fi
-
-# ====================== Сертификаты ======================
-
-echo
-echo -e "${BLUE}SSL-сертификаты...${NC}"
-
-SKIP_CERT=false
-if [[ -f "/etc/letsencrypt/live/${PANEL_DOMAIN}/fullchain.pem" && \
-      -f "/etc/letsencrypt/live/${SUB_DOMAIN}/fullchain.pem" ]]; then
-    echo -e "${GREEN}Сертификаты уже существуют.${NC}"
-    read -rp "Пропустить получение новых? (y/n): " skip
-    [[ "$skip" == "y" || "$skip" == "Y" ]] && SKIP_CERT=true
-fi
-
-if [[ "$SKIP_CERT" == false ]]; then
-    echo -e "${YELLOW}Убедись, что DNS A-записи доменов уже указывают на этот сервер!${NC}"
-    systemctl stop nginx 2>/dev/null || true
-
-    if ! certbot certonly --standalone \
-        -d "$PANEL_DOMAIN" \
-        --non-interactive \
-        --agree-tos \
-        --register-unsafely-without-email \
-        --preferred-challenges http; then
-        echo -e "${RED}Ошибка получения сертификата для $PANEL_DOMAIN${NC}"
-        echo "Проверь DNS и что порт 80 свободен."
-        exit 1
-    fi
-
-    if ! certbot certonly --standalone \
-        -d "$SUB_DOMAIN" \
-        --non-interactive \
-        --agree-tos \
-        --register-unsafely-without-email \
-        --preferred-challenges http; then
-        echo -e "${RED}Ошибка получения сертификата для $SUB_DOMAIN${NC}"
-        exit 1
-    fi
-    echo -e "${GREEN}✓ Сертификаты получены${NC}"
-fi
-
-# ====================== Stream (SNI Router) ======================
-
-echo
-echo -e "${BLUE}Создаю SNI-роутер...${NC}"
-
-backup_file /etc/nginx/stream.d/sni-router.conf
-
-cat > /etc/nginx/stream.d/sni-router.conf <<EOF
-# SNI Router для 3X-UI — сгенерировано setup-3xui-sni
-map \$ssl_preread_server_name \$backend {
-    ${PANEL_DOMAIN}     panel_https;
-    ${SUB_DOMAIN}       sub_https;
-    ${VPN_DOMAIN}       xray_reality;
-    default             reject;
+EOF_STREAM_ROOT
 }
 
-upstream panel_https {
-    server 127.0.0.1:8443;
-}
-
-upstream sub_https {
-    server 127.0.0.1:8444;
-}
-
-upstream xray_reality {
-    server 127.0.0.1:${REALITY_PORT};
-}
-
-upstream reject {
-    server 127.0.0.1:9999;
-}
-
+write_acme(){
+  mkdir -p "$ACME_ROOT/.well-known/acme-challenge"
+  backup "$ACME_CONF"
+  cat >"$ACME_CONF" <<EOF_ACME
+# Pila_port temporary ACME webroot
 server {
-    listen 443 reuseport;
-    listen [::]:443 reuseport;
-    proxy_pass \$backend;
+    listen 80;
+    listen [::]:80;
+    server_name ${PANEL_DOMAIN} ${SUB_DOMAIN};
+    location ^~ /.well-known/acme-challenge/ {
+        root ${ACME_ROOT};
+        default_type text/plain;
+        try_files \$uri =404;
+    }
+    location / { return 404; }
+}
+EOF_ACME
+}
+obtain_cert(){
+  local d=$1; local -a e=()
+  [[ -n "$LE_EMAIL" ]] && e+=(--email "$LE_EMAIL") || e+=(--register-unsafely-without-email)
+  certbot certonly --webroot -w "$ACME_ROOT" -d "$d" --cert-name "$d" --non-interactive --agree-tos --preferred-challenges http "${e[@]}"
+}
+
+write_stream(){
+  local pp=''
+  [[ "$PROXY_PROTOCOL" == on ]] && pp='    proxy_protocol on;'
+  backup "$STREAM_CONF"
+  cat >"$STREAM_CONF" <<EOF_STREAM
+# Pila_port — 3X-UI SNI Router
+map \$ssl_preread_server_name \$pila_backend {
+    ${PANEL_DOMAIN} panel_https;
+    ${SUB_DOMAIN} sub_https;
+    ${VPN_DOMAIN} xray_reality;
+    default reject;
+}
+upstream panel_https { server 127.0.0.1:8443; }
+upstream sub_https { server 127.0.0.1:8444; }
+upstream xray_reality { server 127.0.0.1:${REALITY_PORT}; }
+upstream reject { server 127.0.0.1:9; }
+server {
+    listen 443;
+    listen [::]:443;
     ssl_preread on;
-    proxy_protocol on;
+    proxy_connect_timeout 5s;
+    proxy_timeout 1h;
+${pp}
+    proxy_pass \$pila_backend;
 }
-EOF
+EOF_STREAM
+}
 
-# ====================== HTTPS Панель ======================
-
-backup_file /etc/nginx/conf.d/panel.conf
-
-cat > /etc/nginx/conf.d/panel.conf <<EOF
+write_panel(){
+  local lp='' ip='$remote_addr'
+  if [[ "$PROXY_PROTOCOL" == on ]]; then lp=' proxy_protocol'; ip='$proxy_protocol_addr'; fi
+  backup "$PANEL_CONF"
+  cat >"$PANEL_CONF" <<EOF_PANEL
+# Pila_port — 3X-UI panel
+map \$http_upgrade \$pila_connection_upgrade { default upgrade; '' close; }
 server {
-    listen 127.0.0.1:8443 ssl http2 proxy_protocol;
+    listen 127.0.0.1:8443 ssl${lp};
     server_name ${PANEL_DOMAIN};
-
+    ssl_certificate /etc/letsencrypt/live/${PANEL_DOMAIN}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${PANEL_DOMAIN}/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+EOF_PANEL
+  [[ "$PROXY_PROTOCOL" == on ]] && cat >>"$PANEL_CONF" <<'EOF_PANEL_PROXY'
     set_real_ip_from 127.0.0.1;
     real_ip_header proxy_protocol;
-
-    ssl_certificate     /etc/letsencrypt/live/${PANEL_DOMAIN}/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/${PANEL_DOMAIN}/privkey.pem;
-    ssl_protocols       TLSv1.2 TLSv1.3;
-    ssl_ciphers         HIGH:!aNULL:!MD5;
-    ssl_prefer_server_ciphers on;
-
+EOF_PANEL_PROXY
+  cat >>"$PANEL_CONF" <<EOF_PANEL2
     location ${PANEL_PATH} {
         proxy_pass http://127.0.0.1:${PANEL_PORT};
         proxy_http_version 1.1;
         proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
+        proxy_set_header Connection \$pila_connection_upgrade;
         proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$proxy_protocol_addr;
-        proxy_set_header X-Forwarded-For \$proxy_protocol_addr;
+        proxy_set_header X-Real-IP ${ip};
+        proxy_set_header X-Forwarded-For ${ip};
         proxy_set_header X-Forwarded-Proto \$scheme;
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
         proxy_buffering off;
     }
-
-    location / {
-        return 404;
-    }
+    location / { return 404; }
 }
-EOF
+EOF_PANEL2
+}
 
-# ====================== HTTPS Подписка ======================
-
-backup_file /etc/nginx/conf.d/sub.conf
-
-cat > /etc/nginx/conf.d/sub.conf <<EOF
+write_sub(){
+  local lp='' ip='$remote_addr'
+  if [[ "$PROXY_PROTOCOL" == on ]]; then lp=' proxy_protocol'; ip='$proxy_protocol_addr'; fi
+  backup "$SUB_CONF"
+  cat >"$SUB_CONF" <<EOF_SUB
+# Pila_port — 3X-UI subscription
 server {
-    listen 127.0.0.1:8444 ssl http2 proxy_protocol;
+    listen 127.0.0.1:8444 ssl${lp};
     server_name ${SUB_DOMAIN};
-
+    ssl_certificate /etc/letsencrypt/live/${SUB_DOMAIN}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${SUB_DOMAIN}/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+EOF_SUB
+  [[ "$PROXY_PROTOCOL" == on ]] && cat >>"$SUB_CONF" <<'EOF_SUB_PROXY'
     set_real_ip_from 127.0.0.1;
     real_ip_header proxy_protocol;
-
-    ssl_certificate     /etc/letsencrypt/live/${SUB_DOMAIN}/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/${SUB_DOMAIN}/privkey.pem;
-    ssl_protocols       TLSv1.2 TLSv1.3;
-    ssl_ciphers         HIGH:!aNULL:!MD5;
-    ssl_prefer_server_ciphers on;
-
+EOF_SUB_PROXY
+  cat >>"$SUB_CONF" <<EOF_SUB2
     location / {
         proxy_pass http://127.0.0.1:${SUB_PORT};
+        proxy_http_version 1.1;
         proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$proxy_protocol_addr;
-        proxy_set_header X-Forwarded-For \$proxy_protocol_addr;
+        proxy_set_header X-Real-IP ${ip};
+        proxy_set_header X-Forwarded-For ${ip};
         proxy_set_header X-Forwarded-Proto \$scheme;
         proxy_set_header Range \$http_range;
         proxy_set_header If-Range \$http_if_range;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
         proxy_buffering off;
     }
 }
-EOF
+EOF_SUB2
+}
 
-# ====================== Проверка и запуск ======================
+smoke(){ local d=$1; timeout 8 openssl s_client -connect 127.0.0.1:443 -servername "$d" -brief </dev/null >/dev/null 2>&1; }
+
+[[ $EUID -eq 0 ]] || { echo -e "${RED}✗ Нужен root.${NC}"; exit 1; }
+[[ -f /etc/os-release ]] && . /etc/os-release
+case "${ID:-}" in debian|ubuntu) ;; *) echo -e "${YELLOW}⚠ ОС не Debian/Ubuntu.${NC}"; read -rp 'Продолжить? (y/N): ' a; [[ "$a" =~ ^[Yy]$ ]] || exit 0;; esac
+touch "$LOG_FILE" 2>/dev/null || LOG_FILE=/tmp/setup-3xui-sni.log
+log 'Pila_port start'
+
+cat <<'BANNER'
+======================================================
+  Pila_port — 3X-UI SNI Router
+======================================================
+BANNER
+
+echo -e "${YELLOW}Домены:${NC}"
+PANEL_DOMAIN=$(ask_domain 'Домен панели')
+SUB_DOMAIN=$(ask_domain 'Домен подписки')
+VPN_DOMAIN=$(ask_domain 'SNI для REALITY')
+[[ "$PANEL_DOMAIN" != "$SUB_DOMAIN" && "$PANEL_DOMAIN" != "$VPN_DOMAIN" && "$SUB_DOMAIN" != "$VPN_DOMAIN" ]] || { echo -e "${RED}✗ Домены должны различаться.${NC}"; exit 1; }
+
+echo -e "${YELLOW}Порты:${NC}"
+PANEL_PORT=$(ask_port 'Порт панели 3x-ui' 29395)
+SUB_PORT=$(ask_port 'Порт Subscription' 2096)
+REALITY_PORT=$(ask_port 'Локальный порт REALITY' 4433)
+PANEL_PATH=$(ask_path 'Web Base Path панели' /panel/)
+LE_EMAIL=$(ask_email)
+PROXY_PROTOCOL=${SNI_PROXY_PROTOCOL:-off}; [[ "$PROXY_PROTOCOL" == on ]] || PROXY_PROTOCOL=off
+
+(( PANEL_PORT != SUB_PORT )) || { echo -e "${RED}✗ Panel и Subscription не могут использовать один порт.${NC}"; exit 1; }
+for p in "$PANEL_PORT" "$SUB_PORT" "$REALITY_PORT"; do case "$p" in 80|443|8443|8444) echo -e "${RED}✗ Порт ${p} зарезервирован. Для REALITY используй, например, 4433.${NC}"; exit 1;; esac; done
+
+echo -e "${BLUE}Устанавливаю зависимости...${NC}"
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -y
+apt-get install -y nginx certbot curl dnsutils openssl libnginx-mod-stream
+need nginx; need certbot; need curl; need dig; need openssl
+if ! nginx -V 2>&1 | grep -Eq -- '--with-stream_ssl_preread_module|--with-stream=dynamic'; then echo -e "${RED}✗ Nginx не содержит stream SSL preread.${NC}"; exit 1; fi
+
+# :443 must be owned by the existing Pila_port install or be free for Nginx.
+if [[ -n "$(listeners 443)" ]]; then
+  if [[ -f "$STREAM_CONF" ]] && grep -q 'Pila_port' "$STREAM_CONF"; then
+    echo -e "${GREEN}✓ TCP :443 уже принадлежит Pila_port/Nginx${NC}"
+  else
+    echo -e "${RED}✗ TCP :443 занят до установки:${NC}"; listeners 443; exit 1
+  fi
+fi
+for p in 8443 8444; do port_free "$p" || { echo -e "${RED}✗ Внутренний Nginx :${p} занят:${NC}"; listeners "$p"; exit 1; }; done
+check_backend "$PANEL_PORT" 'Панель 3x-ui'
+check_backend "$SUB_PORT" 'Subscription'
+
+if [[ -f "$PANEL_CONF" ]] && ! grep -q Pila_port "$PANEL_CONF"; then echo -e "${RED}✗ $PANEL_CONF уже существует и не принадлежит Pila_port.${NC}"; exit 1; fi
+if [[ -f "$SUB_CONF" ]] && ! grep -q Pila_port "$SUB_CONF"; then echo -e "${RED}✗ $SUB_CONF уже существует и не принадлежит Pila_port.${NC}"; exit 1; fi
+
+IP=$(curl -4fsS --max-time 5 https://api.ipify.org 2>/dev/null || true)
+DNS_OK=true
+[[ -n "$IP" ]] && check_dns "$PANEL_DOMAIN" "$IP" || DNS_OK=false
+[[ -n "$IP" ]] && check_dns "$SUB_DOMAIN" "$IP" || DNS_OK=false
+if [[ "$DNS_OK" == false ]]; then echo -e "${YELLOW}⚠ DNS panel/sub пока не подтверждён.${NC}"; read -rp "Продолжить? (y/N): " a; [[ "$a" =~ ^[Yy]$ ]] || exit 1; fi
 
 echo
-echo -e "${BLUE}Проверяю конфигурацию Nginx...${NC}"
-if ! nginx -t; then
-    echo -e "${RED}Ошибка в конфигурации Nginx!${NC}"
-    echo "Бэкапы сохранены с расширением .bak.*"
-    exit 1
+echo -e "${GREEN}Будет настроено:${NC}"
+echo "  ${PANEL_DOMAIN} → 127.0.0.1:8443 → ${PANEL_PATH} → 3x-ui:${PANEL_PORT}"
+echo "  ${SUB_DOMAIN} → 127.0.0.1:8444 → Subscription:${SUB_PORT}"
+echo "  ${VPN_DOMAIN} → 127.0.0.1:${REALITY_PORT} → Xray REALITY"
+echo "  public TCP :443 → Nginx SNI"
+echo "  PROXY protocol → ${PROXY_PROTOCOL}"
+read -rp "Продолжить? (y/N): " a; [[ "$a" =~ ^[Yy]$ ]] || exit 0
+
+CERT1=/etc/letsencrypt/live/$PANEL_DOMAIN/fullchain.pem
+KEY1=/etc/letsencrypt/live/$PANEL_DOMAIN/privkey.pem
+CERT2=/etc/letsencrypt/live/$SUB_DOMAIN/fullchain.pem
+KEY2=/etc/letsencrypt/live/$SUB_DOMAIN/privkey.pem
+
+if [[ ! -f "$CERT1" || ! -f "$KEY1" || ! -f "$CERT2" || ! -f "$KEY2" ]]; then
+  if [[ -n "$(listeners 80)" ]] && ss -ltnpH 2>/dev/null | grep -Evq 'users:.*nginx'; then
+    echo -e "${RED}✗ TCP :80 занят не только Nginx; webroot ACME без остановки чужого сервиса невозможен.${NC}"; listeners 80; exit 1
+  fi
+  write_acme
+  if systemctl is-active --quiet nginx; then nginx -t; systemctl reload nginx; else nginx -t; systemctl start nginx; fi
+  [[ -f "$CERT1" ]] || obtain_cert "$PANEL_DOMAIN"
+  [[ -f "$CERT2" ]] || obtain_cert "$SUB_DOMAIN"
+  rm -f "$ACME_CONF"
+  nginx -t
+  systemctl reload nginx
+else
+  echo -e "${GREEN}✓ Сертификаты panel/sub уже существуют${NC}"
 fi
+[[ -f "$CERT1" && -f "$KEY1" && -f "$CERT2" && -f "$KEY2" ]] || { echo -e "${RED}✗ Не получены оба TLS-сертификата.${NC}"; exit 1; }
 
+ensure_stream
+write_stream
+write_panel
+write_sub
+nginx -t
 systemctl enable nginx
-systemctl restart nginx
-
+if systemctl is-active --quiet nginx; then systemctl reload nginx; else systemctl start nginx; fi
 systemctl enable certbot.timer 2>/dev/null || true
 
-log "Установка завершена успешно"
-log "Panel: https://${PANEL_DOMAIN}${PANEL_PATH}"
-log "Sub:   https://${SUB_DOMAIN}/"
-log "REALITY SNI: ${VPN_DOMAIN}"
+ss -ltnH | awk '$4 ~ /:443$/ {ok=1} END{exit(ok?0:1)}' || { echo -e "${RED}✗ Nginx не слушает :443.${NC}"; exit 1; }
+smoke "$PANEL_DOMAIN" && echo -e "${GREEN}✓ TLS/SNI panel OK${NC}" || echo -e "${YELLOW}⚠ TLS/SNI panel не подтверждён${NC}"
+smoke "$SUB_DOMAIN" && echo -e "${GREEN}✓ TLS/SNI subscription OK${NC}" || echo -e "${YELLOW}⚠ TLS/SNI subscription не подтверждён${NC}"
+if listeners "$REALITY_PORT" | grep -Eq '127\.0\.0\.1:|\[::1\]:'; then echo -e "${GREEN}✓ Xray listener найден на loopback :${REALITY_PORT}${NC}"; else echo -e "${YELLOW}⚠ Xray пока не слушает :${REALITY_PORT}; настрой REALITY inbound.${NC}"; fi
 
-echo
-echo -e "${GREEN}======================================================"
-echo "  Готово! Всё настроено."
-echo "======================================================${NC}"
-echo
-echo -e "Панель:       ${GREEN}https://${PANEL_DOMAIN}${PANEL_PATH}${NC}"
-echo -e "Подписка:     ${GREEN}https://${SUB_DOMAIN}/${NC}"
-echo -e "REALITY SNI:  ${GREEN}${VPN_DOMAIN}${NC}"
-echo
-echo -e "${YELLOW}Обязательно настрой в 3x-ui:${NC}"
-echo "1. Панель:"
-echo "   - Listen IP: 127.0.0.1"
-echo "   - Port: ${PANEL_PORT}"
-echo "   - Web Base Path: ${PANEL_PATH}"
-echo
-echo "2. Subscription:"
-echo "   - Listen IP: 127.0.0.1"
-echo "   - Port: ${SUB_PORT}"
-echo "   - Sub URI: https://${SUB_DOMAIN}"
-echo
-echo "3. REALITY inbound:"
-echo "   - Listen: 127.0.0.1:${REALITY_PORT}"
-echo "   - SNI / serverNames: ${VPN_DOMAIN}"
-echo
-echo -e "${CYAN}Проверить статус: systemctl status nginx${NC}"
-echo -e "${CYAN}Логи:             journalctl -u nginx -f${NC}"
-echo -e "${CYAN}Лог скрипта:      ${LOG_FILE}${NC}"
-echo
+log "Pila_port done panel=$PANEL_DOMAIN sub=$SUB_DOMAIN reality=$VPN_DOMAIN:$REALITY_PORT proxy_protocol=$PROXY_PROTOCOL"
+cat <<EOF_DONE
+
+${GREEN}======================================================
+  Готово
+======================================================${NC}
+Панель:      https://${PANEL_DOMAIN}${PANEL_PATH}
+Подписка:    https://${SUB_DOMAIN}/
+REALITY SNI: ${VPN_DOMAIN}
+Public TCP:  :443 (Nginx)
+REALITY:     127.0.0.1:${REALITY_PORT}
+
+3X-UI:
+  Panel Listen: 127.0.0.1:${PANEL_PORT}
+  Web Base Path: ${PANEL_PATH}
+  Subscription: 127.0.0.1:${SUB_PORT}
+  REALITY Listen: 127.0.0.1:${REALITY_PORT}
+EOF_DONE
+if [[ "$PROXY_PROTOCOL" == on ]]; then echo '  Xray: enable acceptProxyProtocol in the REALITY inbound'; else echo '  PROXY protocol: off (no extra Xray setting required)'; fi
+echo -e "${CYAN}Проверка: nginx -t${NC}"
+echo -e "${CYAN}Статус: systemctl status nginx --no-pager -l${NC}"
+echo -e "${CYAN}Логи: journalctl -u nginx -f${NC}"
+echo -e "${CYAN}Лог установки: ${LOG_FILE}${NC}"
