@@ -113,12 +113,12 @@ integrate_existing_stream(){
     BEGIN { inmap=0; have_panel=0; have_sub=0; have_reality=0 }
     /^[[:space:]]*map[[:space:]]+\$ssl_preread_server_name[[:space:]]+\$/ { inmap=1; print; next }
     inmap && $0 ~ /^[[:space:]]*}/ {
-      if (!have_panel) print "    " panel " 127.0.0.1:8443;"
-      if (!have_sub) print "    " sub " 127.0.0.1:8444;"
-      if (!have_reality) print "    " reality " 127.0.0.1:" rport ";"
+      if (!have_panel) print "    " panel_domain " 127.0.0.1:8443;"
+      if (!have_sub) print "    " sub_domain " 127.0.0.1:8444;"
+      if (!have_reality) print "    " reality_domain " 127.0.0.1:" rport ";"
       print; inmap=0; next
     }
-    inmap { if ($1 == panel) have_panel=1; if ($1 == sub) have_sub=1; if ($1 == reality) have_reality=1 }
+    inmap { if ($1 == panel_domain) have_panel=1; if ($1 == sub_domain) have_sub=1; if ($1 == reality_domain) have_reality=1 }
     { print }
   ' "$f" > "$tmp"
   backup "$f"; cat "$tmp" > "$f"; rm -f "$tmp"
