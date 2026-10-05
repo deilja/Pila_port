@@ -109,7 +109,7 @@ integrate_existing_stream(){
   local f="$ACTIVE_STREAM_CONF" tmp
   [[ -n "$f" && -n "$ACTIVE_STREAM_MAP_VAR" ]] || return 1
   tmp=$(mktemp)
-  awk -v panel="$PANEL_DOMAIN" -v sub="$SUB_DOMAIN" -v reality="$VPN_DOMAIN" -v rport="$REALITY_PORT" '
+  awk -v panel_domain="$PANEL_DOMAIN" -v sub_domain="$SUB_DOMAIN" -v reality_domain="$VPN_DOMAIN" -v rport="$REALITY_PORT" '
     BEGIN { inmap=0; have_panel=0; have_sub=0; have_reality=0 }
     /^[[:space:]]*map[[:space:]]+\$ssl_preread_server_name[[:space:]]+\$/ { inmap=1; print; next }
     inmap && $0 ~ /^[[:space:]]*}/ {
