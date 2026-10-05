@@ -198,14 +198,14 @@ write_stream(){
   cat >"$STREAM_CONF" <<EOF_STREAM
 # Pila_port — 3X-UI SNI Router
 map \$ssl_preread_server_name \$pila_backend {
-    \${PANEL_DOMAIN} panel_https;
-    \${SUB_DOMAIN} sub_https;
-    \${VPN_DOMAIN} xray_reality;
+    ${PANEL_DOMAIN} panel_https;
+    ${SUB_DOMAIN} sub_https;
+    ${VPN_DOMAIN} xray_reality;
     default reject;
 }
 upstream panel_https { server 127.0.0.1:8443; }
 upstream sub_https { server 127.0.0.1:8444; }
-upstream xray_reality { server 127.0.0.1:\${REALITY_PORT}; }
+upstream xray_reality { server 127.0.0.1:${REALITY_PORT}; }
 upstream reject { server 127.0.0.1:9; }
 server {
     listen 443;
@@ -213,7 +213,7 @@ server {
     ssl_preread on;
     proxy_connect_timeout 5s;
     proxy_timeout 1h;
-\${pp}
+${pp}
     proxy_pass \$pila_backend;
 }
 EOF_STREAM
