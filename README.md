@@ -191,4 +191,4 @@ openssl s_client -connect YOUR_SERVER_IP:443 -servername sub.example.com -brief
 - UUID/Reality keys;
 - существующие DNS-записи;
 - UDP/AmneziaWG;
-- firewall-правила, кроме явного открытия TCP `80` и `443` в UFW.
+- firewall-правила и UFW.
