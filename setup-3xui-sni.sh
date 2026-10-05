@@ -66,18 +66,18 @@ ask_email(){
 
 backup(){
   local f=$1 b
-  if [[ -f "$f" ]]; then b="${{f}.bak.$(date +%Y%m%d_%H%M%S_$$)"; cp -a "$f" "$b"; BACKUPS+=("$f|$b"); echo -e "${{GREEN}✓ Бэкап: $b${{NC}"; else CREATED+=("$f"); fi
+  if [[ -f "$f" ]]; then b="${f}.bak.$(date +%Y%m%d_%H%M%S_$$)"; cp -a "$f" "$b"; BACKUPS+=("$f|$b"); echo -e "${GREEN}✓ Бэкап: $b${NC}"; else CREATED+=("$f"); fi
 }
 backup_nginx_full(){
   local ts archive
   mkdir -p "$NGINX_BACKUP_DIR"; ts=$(date +%Y%m%d_%H%M%S)
   archive="$NGINX_BACKUP_DIR/nginx-$ts-$$.tar.gz"; tar -C / -czf "$archive" etc/nginx
-  NGINX_FULL_BACKUP="$archive"; echo -e "${{GREEN}✓ Полный бэкап Nginx: $archive${{NC}"
+  NGINX_FULL_BACKUP="$archive"; echo -e "${GREEN}✓ Полный бэкап Nginx: $archive${NC}"
   cat > /usr/local/sbin/pila-port-restore <<'EOF_RESTORE'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 BACKUP_DIR=/var/backups/pila-port
-archive="${{1:-}"
+archive="${1:-}"
 [[ -n "$archive" ]] || archive=$(ls -1t "$BACKUP_DIR"/nginx-*.tar.gz 2>/dev/null | head -1 || true)
 [[ -n "$archive" && -f "$archive" ]] || { echo "Бэкап Nginx не найден: $archive" >&2; exit 1; }
 tar -xzf "$archive" -C /
@@ -102,7 +102,7 @@ discover_existing_stream(){
     mapline=$(grep -E '^[[:space:]]*map[[:space:]]+\$ssl_preread_server_name[[:space:]]+\$[A-Za-z0-9_]+' "$ACTIVE_STREAM_CONF" | head -1 || true)
     [[ -n "$mapline" ]] && ACTIVE_STREAM_MAP_VAR=$(sed -n 's/^[[:space:]]*map[[:space:]]*\$ssl_preread_server_name[[:space:]]*\$\([A-Za-z0-9_]*\).*/\1/p' <<<"$mapline")
     grep -Eq '^[[:space:]]*proxy_protocol[[:space:]]+(on|v2)[[:space:]]*;' "$ACTIVE_STREAM_CONF" && ACTIVE_STREAM_PROXY_PROTOCOL=on
-    echo -e "${{GREEN}✓ Найден активный SNI-router: ${{ACTIVE_STREAM_CONF}${{NC}"
+    echo -e "${GREEN}✓ Найден активный SNI-router: ${ACTIVE_STREAM_CONF}${NC}"
   fi
 }
 integrate_existing_stream(){
@@ -122,7 +122,7 @@ integrate_existing_stream(){
     { print }
   ' "$f" > "$tmp"
   backup "$f"; cat "$tmp" > "$f"; rm -f "$tmp"
-  echo -e "${{GREEN}✓ Existing SNI-router extended; public :443 preserved${{NC}"
+  echo -e "${GREEN}✓ Existing SNI-router extended; public :443 preserved${NC}"
 }
 
 listeners(){ ss -ltnpH 2>/dev/null | awk -v p=":$1" '$4 ~ p"$"'; }
@@ -131,11 +131,11 @@ port_free(){ [[ -z "$(listeners "$1")" ]]; }
 check_backend(){
   local port=$1 label=$2 out
   out=$(listeners "$port")
-  [[ -z "$out" ]] && { echo -e "${{YELLOW}⚠ $label :$port не слушает — настрой его после установки.${{NC}"; return 0; }
+  [[ -z "$out" ]] && { echo -e "${YELLOW}⚠ $label :$port не слушает — настрой его после установки.${NC}"; return 0; }
   if awk -v p=":$port" '$4 ~ p"$" && $4 !~ /^(127\.0\.0\.1|\[::1\]):/ {ok=1} END{exit(ok?0:1)}' <<<"$out"; then
-    echo -e "${{YELLOW}⚠ $label :$port слушает не только loopback — прямой доступ к порту остаётся возможен:${{NC}"; echo "$out"; return 0
+    echo -e "${YELLOW}⚠ $label :$port слушает не только loopback — прямой доступ к порту остаётся возможен:${NC}"; echo "$out"; return 0
   fi
-  echo -e "${{GREEN}✓ $label :$port → loopback${{NC}"
+  echo -e "${GREEN}✓ $label :$port → loopback${NC}"
 }
 
 check_dns(){
@@ -292,8 +292,8 @@ SUB_PORT=$(ask_port 'Порт Subscription' 2096)
 REALITY_PORT=$(ask_port 'Локальный порт REALITY' 4433)
 PANEL_PATH=$(ask_path 'Web Base Path панели' /panel/)
 LE_EMAIL=$(ask_email)
-PROXY_PROTOCOL=${{SNI_PROXY_PROTOCOL:-off}; [[ "$PROXY_PROTOCOL" == on ]] || PROXY_PROTOCOL=off
-if [[ -n "$ACTIVE_STREAM_CONF" && "$ACTIVE_STREAM_PROXY_PROTOCOL" == on && -z "${{SNI_PROXY_PROTOCOL:-}" ]]; then PROXY_PROTOCOL=on; fi
+PROXY_PROTOCOL=${SNI_PROXY_PROTOCOL:-off}; [[ "$PROXY_PROTOCOL" == on ]] || PROXY_PROTOCOL=off
+if [[ -n "$ACTIVE_STREAM_CONF" && "$ACTIVE_STREAM_PROXY_PROTOCOL" == on && -z "${SNI_PROXY_PROTOCOL:-}" ]]; then PROXY_PROTOCOL=on; fi
 
 (( PANEL_PORT != SUB_PORT )) || { echo -e "${RED}✗ Panel и Subscription не могут использовать один порт.${NC}"; exit 1; }
 for p in "$PANEL_PORT" "$SUB_PORT" "$REALITY_PORT"; do case "$p" in 80|443|8443|8444) echo -e "${RED}✗ Порт ${p} зарезервирован. Для REALITY используй, например, 4433.${NC}"; exit 1;; esac; done
@@ -303,7 +303,7 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
 apt-get install -y nginx certbot curl dnsutils openssl libnginx-mod-stream
 need nginx; need certbot; need curl; need dig; need openssl
-if ! nginx -V 2>&1 | grep -Eq -- '--with-stream_ssl_preread_module|--with-stream=dynamic'; then echo -e "${{RED}✗ Nginx не содержит stream SSL preread.${{NC}"; exit 1; fi
+if ! nginx -V 2>&1 | grep -Eq -- '--with-stream_ssl_preread_module|--with-stream=dynamic'; then echo -e "${RED}✗ Nginx не содержит stream SSL preread.${NC}"; exit 1; fi
 
 backup_nginx_full
 discover_existing_stream
@@ -311,17 +311,17 @@ discover_existing_stream
 # Detect and preserve an existing Nginx SNI router on :443.
 if [[ -n "$(listeners 443)" ]]; then
   if ! systemctl is-active --quiet nginx 2>/dev/null; then
-    echo -e "${{RED}✗ TCP :443 занят, но Nginx не активен — автоматическая миграция невозможна.${{NC}"; listeners 443; exit 1
+    echo -e "${RED}✗ TCP :443 занят, но Nginx не активен — автоматическая миграция невозможна.${NC}"; listeners 443; exit 1
   fi
   discover_existing_stream
   if [[ -z "$ACTIVE_STREAM_CONF" || -z "$ACTIVE_STREAM_MAP_VAR" ]]; then
-    echo -e "${{RED}✗ :443 занят Nginx, но активный stream/ssl_preread-router не найден.${{NC}"
+    echo -e "${RED}✗ :443 занят Nginx, но активный stream/ssl_preread-router не найден.${NC}"
     echo "Скрипт не будет ломать существующий HTTPS :443 автоматически."; listeners 443; exit 1
   fi
 else
-  echo -e "${{GREEN}✓ TCP :443 свободен — создаём собственный Nginx SNI-router${{NC}"
+  echo -e "${GREEN}✓ TCP :443 свободен — создаём собственный Nginx SNI-router${NC}"
 fi
-for p in 8443 8444; do port_free "$p" || { echo -e "${{RED}✗ Внутренний Nginx :${{p} занят:${{NC}"; listeners "$p"; exit 1; }; done
+for p in 8443 8444; do port_free "$p" || { echo -e "${RED}✗ Внутренний Nginx :${p} занят:${NC}"; listeners "$p"; exit 1; }; done
 check_backend "$PANEL_PORT" 'Панель 3x-ui'
 check_backend "$SUB_PORT" 'Subscription'
 
@@ -398,7 +398,7 @@ REALITY:     127.0.0.1:${REALITY_PORT}
 EOF_DONE
 if [[ "$PROXY_PROTOCOL" == on ]]; then echo '  Xray: enable acceptProxyProtocol in the REALITY inbound'; else echo '  PROXY protocol: off (no extra Xray setting required)'; fi
 echo "  Restore: /usr/local/sbin/pila-port-restore"
-echo "  Full Nginx backup: ${{NGINX_FULL_BACKUP:-${{NGINX_BACKUP_DIR}}"
+echo "  Full Nginx backup: ${NGINX_FULL_BACKUP:-${NGINX_BACKUP_DIR}}"
 echo -e "${CYAN}Проверка: nginx -t${NC}"
 echo -e "${CYAN}Статус: systemctl status nginx --no-pager -l${NC}"
 echo -e "${CYAN}Логи: journalctl -u nginx -f${NC}"
