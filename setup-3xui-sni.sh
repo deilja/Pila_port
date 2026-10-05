@@ -145,6 +145,8 @@ check_dns(){
 }
 
 ensure_stream(){
+  # Existing active SNI stream already owns :443; do not create a second stream block.
+  [[ -n "$ACTIVE_STREAM_CONF" ]] && return 0
   mkdir -p "$STREAM_DIR"
   if grep -Fq 'include /etc/nginx/stream.d/*.conf;' "$NGINX_CONF"; then return; fi
   if grep -Eq '^[[:space:]]*stream[[:space:]]*\{' "$NGINX_CONF"; then
