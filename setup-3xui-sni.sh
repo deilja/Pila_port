@@ -1,11 +1,11 @@
 #!/bin/bash
 
 # ============================================================
-#  3X-UI SNI Router + Separate Subscription Domain
+#  3X-UI SNI Router + Separate Subscription Domain (v2)
 #  Nginx Stream (SNI) + HTTPS для панели и подписки
 # ============================================================
 
-set -e
+set -euo pipefail
 
 # Цвета
 RED='\033[0;31m'
@@ -15,14 +15,20 @@ BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
+LOG_FILE="/var/log/setup-3xui-sni.log"
+
 echo -e "${BLUE}"
 echo "======================================================"
-echo "  3X-UI SNI Router + Separate Subscription"
+echo "  3X-UI SNI Router + Separate Subscription  (v2)"
 echo "  (Nginx Stream + HTTPS)"
 echo "======================================================"
 echo -e "${NC}"
 
 # ====================== Функции ======================
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE" >/dev/null
+}
 
 check_root() {
     if [[ $EUID -ne 0 ]]; then
@@ -31,10 +37,26 @@ check_root() {
     fi
 }
 
-check_port() {
+check_os() {
+    if [[ -f /etc/os-release ]]; then
+        . /etc/os-release
+        case "$ID" in
+            debian|ubuntu)
+                echo -e "${GREEN}✓ ОС: $PRETTY_NAME${NC}"
+                ;;
+            *)
+                echo -e "${YELLOW}⚠ ОС $PRETTY_NAME не тестировалась (ожидается Debian/Ubuntu)${NC}"
+                read -rp "Продолжить? (y/n): " ans
+                [[ "$ans" != "y" && "$ans" != "Y" ]] && exit 0
+                ;;
+        esac
+    fi
+}
+
+check_port_free() {
     local port=$1
     local name=$2
-    if ss -tuln | grep -qE ":${port}\\s"; then
+    if ss -tuln | grep -qE ":${port}\s"; then
         echo -e "${RED}✗ Порт ${port} (${name}) занят${NC}"
         return 1
     else
@@ -46,7 +68,7 @@ check_port() {
 check_port_used() {
     local port=$1
     local name=$2
-    if ss -tuln | grep -qE ":${port}\\s"; then
+    if ss -tuln | grep -qE ":${port}\s"; then
         echo -e "${GREEN}✓ ${name} найден на порту ${port}${NC}"
         return 0
     else
@@ -65,7 +87,7 @@ ask_domain() {
             echo -e "${RED}Домен не может быть пустым${NC}"
             continue
         fi
-        if [[ ! "$domain" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?\\.[a-z]{2,}$ ]]; then
+        if [[ ! "$domain" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]]; then
             echo -e "${RED}Некорректный домен. Пример: panel.example.com${NC}"
             continue
         fi
@@ -89,9 +111,66 @@ ask_port() {
     done
 }
 
+ask_path() {
+    local prompt=$1
+    local default=$2
+    local path
+    while true; do
+        read -rp "$(echo -e "${CYAN}${prompt} [${default}]: ${NC}")" path
+        path=${path:-$default}
+        [[ "$path" != /* ]] && path="/$path"
+        [[ "$path" != */ ]] && path="${path}/"
+        if [[ "$path" =~ ^/[a-zA-Z0-9/_-]+/$ ]]; then
+            echo "$path"
+            return
+        fi
+        echo -e "${RED}Путь должен быть вида /panel/ (только буквы, цифры, -, _)${NC}"
+    done
+}
+
+get_server_ip() {
+    local ip
+    ip=$(curl -s --max-time 3 https://ifconfig.me 2>/dev/null || true)
+    [[ -z "$ip" ]] && ip=$(curl -s --max-time 3 https://api.ipify.org 2>/dev/null || true)
+    [[ -z "$ip" ]] && ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    echo "$ip"
+}
+
+check_dns() {
+    local domain=$1
+    local expected_ip=$2
+    local resolved
+    resolved=$(dig +short "$domain" A 2>/dev/null | head -1 || true)
+    if [[ -z "$resolved" ]]; then
+        echo -e "${YELLOW}⚠ DNS: $domain не резолвится${NC}"
+        return 1
+    fi
+    if [[ "$resolved" == "$expected_ip" ]]; then
+        echo -e "${GREEN}✓ DNS: $domain → $resolved${NC}"
+        return 0
+    else
+        echo -e "${YELLOW}⚠ DNS: $domain → $resolved (ожидался $expected_ip)${NC}"
+        return 1
+    fi
+}
+
+backup_file() {
+    local file=$1
+    if [[ -f "$file" ]]; then
+        local bak="${file}.bak.$(date +%Y%m%d_%H%M%S)"
+        cp -a "$file" "$bak"
+        echo -e "${GREEN}✓ Бэкап: $bak${NC}"
+        log "Backup: $file → $bak"
+    fi
+}
+
 # ====================== Старт ======================
 
 check_root
+check_os
+
+touch "$LOG_FILE" 2>/dev/null || LOG_FILE="/tmp/setup-3xui-sni.log"
+log "=== Запуск скрипта ==="
 
 echo -e "${YELLOW}Введи домены (без https:// и без слэшей):${NC}"
 PANEL_DOMAIN=$(ask_domain "Домен панели (например panel.example.com)")
@@ -99,22 +178,21 @@ SUB_DOMAIN=$(ask_domain "Домен подписки (например sub.examp
 VPN_DOMAIN=$(ask_domain "Домен REALITY / VPN (например vpn.example.com)")
 
 echo
-echo -e "${YELLOW}Порты 3x-ui (оставь по умолчанию, если не менял):${NC}"
+echo -e "${YELLOW}Порты и путь 3x-ui:${NC}"
 PANEL_PORT=$(ask_port "Порт панели 3x-ui" "29395")
 SUB_PORT=$(ask_port "Порт Subscription" "2096")
 REALITY_PORT=$(ask_port "Локальный порт REALITY (Xray)" "443")
+PANEL_PATH=$(ask_path "Web Base Path панели" "/panel/")
 
 echo
 echo -e "${BLUE}Проверяю порты...${NC}"
 
 PORTS_OK=true
 
-# Внешний порт 443 должен быть свободен (мы его займём)
-check_port 443 "внешний HTTPS/SNI" || PORTS_OK=false
-
-# Внутренние порты Nginx HTTPS
-check_port 8443 "Nginx HTTPS панели" || PORTS_OK=false
-check_port 8444 "Nginx HTTPS подписки" || PORTS_OK=false
+check_port_free 443  "внешний HTTPS/SNI" || PORTS_OK=false
+check_port_free 80   "HTTP (для certbot)" || PORTS_OK=false
+check_port_free 8443 "Nginx HTTPS панели" || PORTS_OK=false
+check_port_free 8444 "Nginx HTTPS подписки" || PORTS_OK=false
 
 echo
 echo -e "${BLUE}Проверка портов 3x-ui:${NC}"
@@ -142,13 +220,30 @@ if [[ "$PANEL_OK" == false || "$SUB_OK" == false ]]; then
 fi
 
 echo
+echo -e "${BLUE}Проверяю DNS...${NC}"
+SERVER_IP=$(get_server_ip)
+echo -e "IP сервера: ${CYAN}${SERVER_IP}${NC}"
+
+DNS_OK=true
+check_dns "$PANEL_DOMAIN" "$SERVER_IP" || DNS_OK=false
+check_dns "$SUB_DOMAIN" "$SERVER_IP" || DNS_OK=false
+
+if [[ "$DNS_OK" == false ]]; then
+    echo
+    echo -e "${YELLOW}DNS ещё не указывает на этот сервер (или dig недоступен).${NC}"
+    echo -e "Certbot может не пройти. Продолжить? (рекомендуется дождаться обновления DNS)"
+    read -rp "(y/n): " cont
+    [[ "$cont" != "y" && "$cont" != "Y" ]] && exit 0
+fi
+
+echo
 echo -e "${GREEN}Домены:${NC}"
 echo "  Панель:      $PANEL_DOMAIN"
 echo "  Подписка:    $SUB_DOMAIN"
 echo "  REALITY:     $VPN_DOMAIN"
 echo
-echo -e "${GREEN}Порты:${NC}"
-echo "  Панель:      $PANEL_PORT"
+echo -e "${GREEN}Порты и путь:${NC}"
+echo "  Панель:      $PANEL_PORT  (path: $PANEL_PATH)"
 echo "  Subscription:$SUB_PORT"
 echo "  REALITY:     $REALITY_PORT"
 echo
@@ -158,57 +253,75 @@ read -rp "Всё верно? Продолжить установку? (y/n): " c
 # ====================== Установка пакетов ======================
 
 echo
-echo -e "${BLUE}Устанавливаю Nginx + certbot...${NC}"
+echo -e "${BLUE}Устанавливаю Nginx + certbot + зависимости...${NC}"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
-apt-get install -y nginx certbot python3-certbot-nginx curl
+apt-get install -y nginx certbot python3-certbot-nginx curl dnsutils
 
-# Включаем stream модуль
-if ! grep -q "stream {" /etc/nginx/nginx.conf; then
-    # Добавляем include stream в конец nginx.conf
-    if ! grep -q "include /etc/nginx/stream.d" /etc/nginx/nginx.conf; then
-        cat >> /etc/nginx/nginx.conf <<'EOF'
-
-# Stream (SNI router)
-stream {
-    include /etc/nginx/stream.d/*.conf;
-}
-EOF
-    fi
+if command -v ufw >/dev/null 2>&1; then
+    echo -e "${BLUE}Открываю порты в ufw...${NC}"
+    ufw allow 80/tcp  >/dev/null 2>&1 || true
+    ufw allow 443/tcp >/dev/null 2>&1 || true
+    echo -e "${GREEN}✓ ufw: 80 и 443 разрешены${NC}"
 fi
 
 mkdir -p /etc/nginx/stream.d
 mkdir -p /etc/nginx/conf.d
 
+if ! grep -q "include /etc/nginx/stream.d" /etc/nginx/nginx.conf; then
+    if ! grep -q "^stream {" /etc/nginx/nginx.conf; then
+        backup_file /etc/nginx/nginx.conf
+        cat >> /etc/nginx/nginx.conf <<'EOF'
+
+# Stream (SNI router) — добавлено setup-3xui-sni
+stream {
+    include /etc/nginx/stream.d/*.conf;
+}
+EOF
+        echo -e "${GREEN}✓ Добавлен stream-блок в nginx.conf${NC}"
+    else
+        echo -e "${YELLOW}⚠ stream-блок уже есть, но include stream.d не найден — проверь вручную${NC}"
+    fi
+fi
+
 # ====================== Сертификаты ======================
 
 echo
-echo -e "${BLUE}Получаю SSL-сертификаты (Let's Encrypt)...${NC}"
-echo -e "${YELLOW}Убедись, что DNS A-записи доменов уже указывают на этот сервер!${NC}"
+echo -e "${BLUE}SSL-сертификаты...${NC}"
 
-systemctl stop nginx 2>/dev/null || true
-
-# Панель
-if ! certbot certonly --standalone \
-    -d "$PANEL_DOMAIN" \
-    --non-interactive \
-    --agree-tos \
-    --register-unsafely-without-email \
-    --preferred-challenges http; then
-    echo -e "${RED}Ошибка получения сертификата для $PANEL_DOMAIN${NC}"
-    echo "Проверь DNS и что порт 80 свободен."
-    exit 1
+SKIP_CERT=false
+if [[ -f "/etc/letsencrypt/live/${PANEL_DOMAIN}/fullchain.pem" && \
+      -f "/etc/letsencrypt/live/${SUB_DOMAIN}/fullchain.pem" ]]; then
+    echo -e "${GREEN}Сертификаты уже существуют.${NC}"
+    read -rp "Пропустить получение новых? (y/n): " skip
+    [[ "$skip" == "y" || "$skip" == "Y" ]] && SKIP_CERT=true
 fi
 
-# Подписка
-if ! certbot certonly --standalone \
-    -d "$SUB_DOMAIN" \
-    --non-interactive \
-    --agree-tos \
-    --register-unsafely-without-email \
-    --preferred-challenges http; then
-    echo -e "${RED}Ошибка получения сертификата для $SUB_DOMAIN${NC}"
-    exit 1
+if [[ "$SKIP_CERT" == false ]]; then
+    echo -e "${YELLOW}Убедись, что DNS A-записи доменов уже указывают на этот сервер!${NC}"
+    systemctl stop nginx 2>/dev/null || true
+
+    if ! certbot certonly --standalone \
+        -d "$PANEL_DOMAIN" \
+        --non-interactive \
+        --agree-tos \
+        --register-unsafely-without-email \
+        --preferred-challenges http; then
+        echo -e "${RED}Ошибка получения сертификата для $PANEL_DOMAIN${NC}"
+        echo "Проверь DNS и что порт 80 свободен."
+        exit 1
+    fi
+
+    if ! certbot certonly --standalone \
+        -d "$SUB_DOMAIN" \
+        --non-interactive \
+        --agree-tos \
+        --register-unsafely-without-email \
+        --preferred-challenges http; then
+        echo -e "${RED}Ошибка получения сертификата для $SUB_DOMAIN${NC}"
+        exit 1
+    fi
+    echo -e "${GREEN}✓ Сертификаты получены${NC}"
 fi
 
 # ====================== Stream (SNI Router) ======================
@@ -216,8 +329,10 @@ fi
 echo
 echo -e "${BLUE}Создаю SNI-роутер...${NC}"
 
+backup_file /etc/nginx/stream.d/sni-router.conf
+
 cat > /etc/nginx/stream.d/sni-router.conf <<EOF
-# SNI Router для 3X-UI
+# SNI Router для 3X-UI — сгенерировано setup-3xui-sni
 map \$ssl_preread_server_name \$backend {
     ${PANEL_DOMAIN}     panel_https;
     ${SUB_DOMAIN}       sub_https;
@@ -252,18 +367,23 @@ EOF
 
 # ====================== HTTPS Панель ======================
 
+backup_file /etc/nginx/conf.d/panel.conf
+
 cat > /etc/nginx/conf.d/panel.conf <<EOF
 server {
     listen 127.0.0.1:8443 ssl http2 proxy_protocol;
     server_name ${PANEL_DOMAIN};
 
+    set_real_ip_from 127.0.0.1;
+    real_ip_header proxy_protocol;
+
     ssl_certificate     /etc/letsencrypt/live/${PANEL_DOMAIN}/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/${PANEL_DOMAIN}/privkey.pem;
     ssl_protocols       TLSv1.2 TLSv1.3;
     ssl_ciphers         HIGH:!aNULL:!MD5;
+    ssl_prefer_server_ciphers on;
 
-    # Панель 3x-ui
-    location /panel/ {
+    location ${PANEL_PATH} {
         proxy_pass http://127.0.0.1:${PANEL_PORT};
         proxy_http_version 1.1;
         proxy_set_header Upgrade \$http_upgrade;
@@ -285,15 +405,21 @@ EOF
 
 # ====================== HTTPS Подписка ======================
 
+backup_file /etc/nginx/conf.d/sub.conf
+
 cat > /etc/nginx/conf.d/sub.conf <<EOF
 server {
     listen 127.0.0.1:8444 ssl http2 proxy_protocol;
     server_name ${SUB_DOMAIN};
 
+    set_real_ip_from 127.0.0.1;
+    real_ip_header proxy_protocol;
+
     ssl_certificate     /etc/letsencrypt/live/${SUB_DOMAIN}/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/${SUB_DOMAIN}/privkey.pem;
     ssl_protocols       TLSv1.2 TLSv1.3;
     ssl_ciphers         HIGH:!aNULL:!MD5;
+    ssl_prefer_server_ciphers on;
 
     location / {
         proxy_pass http://127.0.0.1:${SUB_PORT};
@@ -314,21 +440,26 @@ echo
 echo -e "${BLUE}Проверяю конфигурацию Nginx...${NC}"
 if ! nginx -t; then
     echo -e "${RED}Ошибка в конфигурации Nginx!${NC}"
+    echo "Бэкапы сохранены с расширением .bak.*"
     exit 1
 fi
 
 systemctl enable nginx
 systemctl restart nginx
 
-# Автопродление сертификатов
 systemctl enable certbot.timer 2>/dev/null || true
+
+log "Установка завершена успешно"
+log "Panel: https://${PANEL_DOMAIN}${PANEL_PATH}"
+log "Sub:   https://${SUB_DOMAIN}/"
+log "REALITY SNI: ${VPN_DOMAIN}"
 
 echo
 echo -e "${GREEN}======================================================"
 echo "  Готово! Всё настроено."
 echo "======================================================${NC}"
 echo
-echo -e "Панель:       ${GREEN}https://${PANEL_DOMAIN}/panel/${NC}"
+echo -e "Панель:       ${GREEN}https://${PANEL_DOMAIN}${PANEL_PATH}${NC}"
 echo -e "Подписка:     ${GREEN}https://${SUB_DOMAIN}/${NC}"
 echo -e "REALITY SNI:  ${GREEN}${VPN_DOMAIN}${NC}"
 echo
@@ -336,7 +467,7 @@ echo -e "${YELLOW}Обязательно настрой в 3x-ui:${NC}"
 echo "1. Панель:"
 echo "   - Listen IP: 127.0.0.1"
 echo "   - Port: ${PANEL_PORT}"
-echo "   - Web Base Path: /panel/"
+echo "   - Web Base Path: ${PANEL_PATH}"
 echo
 echo "2. Subscription:"
 echo "   - Listen IP: 127.0.0.1"
@@ -349,4 +480,5 @@ echo "   - SNI / serverNames: ${VPN_DOMAIN}"
 echo
 echo -e "${CYAN}Проверить статус: systemctl status nginx${NC}"
 echo -e "${CYAN}Логи:             journalctl -u nginx -f${NC}"
+echo -e "${CYAN}Лог скрипта:      ${LOG_FILE}${NC}"
 echo
