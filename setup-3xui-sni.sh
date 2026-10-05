@@ -188,9 +188,36 @@ obtain_cert(){
 }
 
 write_stream(){
-  if [[ -n "$ACTIVE_STREAM_CONF" && -n "$ACTIVE_STREAM_MAP_VAR" ]]; then integrate_existing_stream; return; fi
-  local pp=''; [[ "$PROXY_PROTOCOL" == on ]] && pp='    proxy_protocol on;'
+  if [[ -n "$ACTIVE_STREAM_CONF" && -n "$ACTIVE_STREAM_MAP_VAR" ]]; then
+    integrate_existing_stream
+    return
+  fi
+  local pp=''
+  [[ "$PROXY_PROTOCOL" == on ]] && pp='    proxy_protocol on;'
   backup "$STREAM_CONF"
+  cat >"$STREAM_CONF" <<EOF_STREAM
+# Pila_port — 3X-UI SNI Router
+map \$ssl_preread_server_name \$pila_backend {
+    ${{PANEL_DOMAIN} panel_https;
+    ${{SUB_DOMAIN} sub_https;
+    ${{VPN_DOMAIN} xray_reality;
+    default reject;
+}
+upstream panel_https { server 127.0.0.1:8443; }
+upstream sub_https { server 127.0.0.1:8444; }
+upstream xray_reality { server 127.0.0.1:${{REALITY_PORT}; }
+upstream reject { server 127.0.0.1:9; }
+server {
+    listen 443;
+    listen [::]:443;
+    ssl_preread on;
+    proxy_connect_timeout 5s;
+    proxy_timeout 1h;
+${{pp}
+    proxy_pass \$pila_backend;
+}
+EOF_STREAM
+}
 
 write_panel(){
   local lp='' ip='$remote_addr'
